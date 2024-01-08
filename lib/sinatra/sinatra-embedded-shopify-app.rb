@@ -2,9 +2,10 @@
 
 require 'sinatra/base'
 require 'sinatra/activerecord'
+require 'sinatra/cookies'
+require 'attr_encrypted'
 require 'active_support/all'
 require 'shopify_api'
-require 'omniauth-shopify-oauth2'
 
 # Sinatra
 module Sinatra
@@ -33,8 +34,8 @@ module Sinatra
 
         else
           shop_name = session[:shopify][:shop]
-          token = session[:shopify][:token]
-          activate_shopify_api(shop_name, token)
+          this_session = session[:shopify][:outh_session]
+          activate_shopify_api(shop_name, this_session)
           yield shop_name
         end
       rescue ActiveResource::UnauthorizedAccess
@@ -53,9 +54,9 @@ module Sinatra
         session[:return_params] = return_params if return_params
 
         if (shop_name = sanitized_shop_param(params))
-          redirect "/login?shop=#{shop_name}"
+          redirect "/install?shop=#{shop_name}"
         else
-          redirect '/login'
+          redirect '/install'
         end
       end
 
@@ -78,8 +79,7 @@ module Sinatra
       end
 
       def activate_shopify_api(shop_name, token)
-        api_session = ShopifyAPI::Session.new(domain: shop_name, token: token, api_version: settings.api_version)
-        ShopifyAPI::Base.activate_session(api_session)
+        ShopifyAPI::Context.activate_session(outh_session)
       end
 
       def receive_webhook
@@ -105,8 +105,7 @@ module Sinatra
 
       def verify_shopify_webhook
         data = request.body.read.to_s
-        digest = OpenSSL::Digest.new('sha256')
-        calculated_hmac = Base64.encode64(OpenSSL::HMAC.digest(digest, settings.shared_secret, data)).strip
+        calculated_hmac = Base64.strict_encode64(OpenSSL::HMAC.digest('sha256', settings.shared_secret, data))
         request.body.rewind
 
         if calculated_hmac == request.env['HTTP_X_SHOPIFY_HMAC_SHA256']
@@ -121,7 +120,7 @@ module Sinatra
     # needs to be dynamic to incude the current shop
     class ContentSecurityPolicy < Rack::Protection::Base
       def csp_policy(env)
-        "frame-ancestors #{current_shop(env)} https://admin.shopify.com;"
+        "frame-ancestors 'self' #{current_shop(env)} https://admin.shopify.com;"
       end
 
       def call(env)
@@ -169,7 +168,7 @@ module Sinatra
 
       app.set :protection, except: :frame_options
 
-      app.set :api_version, '2019-07'
+      app.set :api_version, '2023-10'
       app.set :scope, 'read_products, read_orders'
 
       app.set :api_key, ENV['SHOPIFY_API_KEY']
@@ -195,68 +194,62 @@ module Sinatra
         app.settings.webhook_routes.include?(env['PATH_INFO'])
       }
 
-      OmniAuth.config.allowed_request_methods = [:post]
-
-      app.use OmniAuth::Builder do
-        provider :shopify,
-                 app.settings.api_key,
-                 app.settings.shared_secret,
-                 scope: app.settings.scope,
-                 setup: lambda { |env|
-                   shop = if env['REQUEST_METHOD'] == 'POST'
-                            env['rack.request.form_hash']['shop']
-                          else
-                            Rack::Utils.parse_query(env['QUERY_STRING'])['shop']
-                          end
-
-                   site_url = "https://#{shop}"
-                   env['omniauth.strategy'].options[:client_options][:site] = site_url
-                 }
-      end
-
-      ShopifyAPI::Session.setup(
+      ShopifyAPI::Context.setup(
         api_key: app.settings.api_key,
-        secret: app.settings.shared_secret
+        api_secret_key: app.settings.shared_secret,
+        host_name: app.settings.hostname,
+        scope: app.settings.scope,
+        is_embedded: true,
+        is_private: false,
+        api_version: app.settings.api_version
       )
 
-      app.get '/login' do
-        erb :login, layout: false
-      end
-
-      app.get '/logout' do
-        clear_session
-        redirect '/login'
+      app.get '/install' do
+        shop_name = sanitized_shop_param(params)
+        if ShopifyAPI::Context.embedded? && (!params[:embedded].present? || params[:embedded] != "1")
+          auth_response = ShopifyAPI::Auth::Oauth.begin_auth(shop: shop_name, redirect_path: "/auth/shopify/callback")
+          session[auth_response[:cookie].name] = auth_response[:cookie].value
+          redirect auth_response[:auth_route]
+        else
+          erb :oauth_callback, locals: { redirectUrl: "https://#{shop_name}/api/auth", shop_host: shop_host }
+        end
       end
 
       app.get '/auth/shopify/callback' do
-        shop_name = params['shop']
-        token = request.env['omniauth.auth']['credentials']['token']
-        host = params['host']
+        auth_query = ShopifyAPI::Auth::Oauth::AuthQuery.new(
+                  code: params['code'], host: params['host'], timestamp: params['timestamp'],
+                  state: params['state'], hmac: params['hmac'], shop: params['shop'])
+        begin
+          auth_result = ShopifyAPI::Auth::Oauth.validate_auth_callback(
+            cookies: session.to_h,
+            auth_query: auth_query
+          )
+          session[auth_result[:cookie].name] = auth_result[:cookie].value
+          p "OAuth complete! New access token: #{auth_result[:session].access_token}"
+          
+          shop = Shop.find_or_initialize_by(shopify_domain: params['shop'])
+          shop.shopify_token = auth_result[:session].access_token
+          shop.save!
 
-        shop = Shop.find_or_initialize_by(shopify_domain: shop_name)
-        shop.shopify_token = token
-        shop.save!
+          session[:shopify] = {
+            shop: params['shop'],
+            host: params['host'],
+            token: auth_result[:session].access_token,
+            outh_session: auth_result[:session]
+          }
 
-        session[:shopify] = {
-          shop: shop_name,
-          host: host,
-          token: token
-        }
+          after_shopify_auth()
 
-        after_shopify_auth
+          return_params = session[:return_params]
+          session.delete(:return_params)
 
-        return_params = session[:return_params]
-        session.delete(:return_params)
+          return_to = '/'
+          return_to += "?#{return_params.to_query}" if return_params.present?
+          redirect return_to
 
-        return_to = '/'
-        return_to += "?#{return_params.to_query}" if return_params.present?
-
-        redirect return_to
-      end
-
-      app.get '/auth/failure' do
-        erb "<h1>Authentication Failed:</h1>
-             <h3>message:<h3> <pre>#{params}</pre>", layout: false
+        rescue => e
+          p e.message
+        end
       end
     end
   end
@@ -269,6 +262,13 @@ class Shop < ActiveRecord::Base
   def self.secret
     @secret ||= ENV['SECRET']
   end
+
+  attr_encrypted :shopify_token,
+    key: secret,
+    attribute: 'token_encrypted',
+    mode: :single_iv_and_salt,
+    algorithm: 'aes-256-cbc',
+    insecure_mode: true
 
   validates_presence_of :shopify_domain
   validates_presence_of :shopify_token, on: :create
