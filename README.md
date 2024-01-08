@@ -101,9 +101,9 @@ end
 Note this method does not active a Shopify session by default but the current_shop* methods still work. It is not advised but if you want to handle the webhook in a web request you will need to activate the ShopifyAPI session manually:
 
 ```ruby
-shop = Shop.find_by(shopify_domain: current_shop_name)
-api_session = ShopifyAPI::Session.new(shop.shopify_domain, shop.shopify_token)
-ShopifyAPI::Base.activate_session(api_session)
+shop = Shop.find_by(shopify_domain: shop_name)
+this_session = ShopifyAPI::Auth::Session.new(shop: shop.name, access_token: shop.shopify_token)
+ShopifyAPI::Context.activate_session(this_session)
 ```
 
 It's impossible to control the flow of webhooks to your app from Shopify especially if a larger store installs your app or if a shop has a flash sale. To prevent your app from getting overloaded with webhook requests it is best practise to process webhooks in a background queue and return a `200` to Shopify immediately. Ruby has several good background job frameworks that work with Sinatra including [Sidekiq](https://github.com/mperham/sidekiq) and [Resque](https://github.com/resque/resque).
